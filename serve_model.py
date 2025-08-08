@@ -12,6 +12,8 @@ from starlette.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 import jwt
 import uuid
+import requests  # for Firebase REST sign-in
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")  # Firebase Web API key
 from preprocess import load_scaler_and_features, preprocess_input
 
 app = FastAPI(title="Oil Adulteration Detection API", version="1.0.0")
@@ -56,9 +58,8 @@ app.add_middleware(
 # Security
 security = HTTPBearer()
 
-# In-memory storage for demo (replace with database in production)
+# In-memory storage (analytics history)
 analysis_history = []
-users = {}  # In-memory user storage for demo
 
 # Pydantic models
 class SignUpRequest(BaseModel):
@@ -110,103 +111,87 @@ except Exception as e:
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """Verify JWT token and return user_id"""
     token = credentials.credentials
-    
-    if FIREBASE_ENABLED:
-        try:
-            # Verify Firebase token
-            decoded_token = auth.verify_id_token(token)
-            return decoded_token['uid']
-        except Exception as e:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    else:
-        # Simple JWT verification for demo
-        try:
-            # For demo purposes, we'll use a simple approach
-            # In production, use proper JWT verification
-            if token.startswith("demo_token_"):
-                user_id = token.replace("demo_token_", "")
-                if user_id in users:
-                    return user_id
-            raise HTTPException(status_code=401, detail="Invalid token")
-        except:
-            raise HTTPException(status_code=401, detail="Invalid token")
+    # Only Firebase tokens are supported
+    if not FIREBASE_ENABLED:
+        raise HTTPException(status_code=401, detail="Firebase not enabled")
+    try:
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token['uid']
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 def generate_demo_token(user_id: str) -> str:
     """Generate demo token (replace with proper JWT in production)"""
-    if FIREBASE_ENABLED:
-        # In production, Firebase handles token generation
-        pass
-    return f"demo_token_{user_id}"
+    # Demo tokens are no longer supported
+    raise HTTPException(status_code=501, detail="Demo tokens not supported")
 
 # Authentication endpoints
 @app.post("/auth/signup", response_model=AuthResponse)
 async def signup(request: SignUpRequest):
     """Sign up a new user"""
-    if FIREBASE_ENABLED:
-        try:
-            # Create user with Firebase
-            user = auth.create_user(
-                email=request.email,
-                password=request.password,
-                display_name=request.name
-            )
-            
-            # Generate custom token
-            token = auth.create_custom_token(user.uid)
-            
-            return AuthResponse(
-                token=token.decode('utf-8'),
-                user_id=user.uid,
-                email=request.email,
-                name=request.name
-            )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Signup failed: {str(e)}")
-    else:
-        # Demo implementation
-        if request.email in [user['email'] for user in users.values()]:
-            raise HTTPException(status_code=400, detail="Email already exists")
-        
-        user_id = str(uuid.uuid4())
-        users[user_id] = {
-            'name': request.name,
-            'email': request.email,
-            'password': request.password  # In production, hash this!
-        }
-        
-        token = generate_demo_token(user_id)
-        
+    if not FIREBASE_ENABLED:
+        raise HTTPException(status_code=500, detail="Firebase Admin SDK not initialized")
+    if not FIREBASE_API_KEY:
+        raise HTTPException(status_code=500, detail="FIREBASE_API_KEY not set")
+    try:
+        # Create user with Firebase
+        user = auth.create_user(
+            email=request.email,
+            password=request.password,
+            display_name=request.name
+        )
+        # Generate custom auth token and exchange for ID token
+        custom_token = auth.create_custom_token(user.uid).decode('utf-8')
+        resp = requests.post(
+            f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={FIREBASE_API_KEY}",
+            json={"token": custom_token, "returnSecureToken": True}
+        )
+        resp.raise_for_status()
+        id_token = resp.json().get("idToken")
+        if not id_token:
+            raise HTTPException(status_code=500, detail="Failed to retrieve ID token")
         return AuthResponse(
-            token=token,
-            user_id=user_id,
+            token=id_token,
+            user_id=user.uid,
             email=request.email,
             name=request.name
         )
+    except requests.exceptions.HTTPError as http_err:
+        err = http_err.response.json().get("error", {}).get("message", str(http_err))
+        raise HTTPException(status_code=400, detail=f"Signup failed: {err}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Signup failed: {e}")
 
 @app.post("/auth/signin", response_model=AuthResponse)
 async def signin(request: SignInRequest):
     """Sign in an existing user"""
-    if FIREBASE_ENABLED:
-        try:
-            # Firebase handles authentication
-            # You would typically use Firebase Auth SDK on client side
-            # and verify the token here
-            raise HTTPException(status_code=501, detail="Use Firebase Auth SDK on client side")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Signin failed: {str(e)}")
-    else:
-        # Demo implementation
-        for user_id, user_data in users.items():
-            if user_data['email'] == request.email and user_data['password'] == request.password:
-                token = generate_demo_token(user_id)
-                return AuthResponse(
-                    token=token,
-                    user_id=user_id,
-                    email=request.email,
-                    name=user_data['name']
-                )
-        
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not FIREBASE_ENABLED:
+        raise HTTPException(status_code=500, detail="Firebase Admin SDK not initialized")
+    if not FIREBASE_API_KEY:
+        raise HTTPException(status_code=500, detail="FIREBASE_API_KEY not set")
+    try:
+        resp = requests.post(
+            f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}",
+            json={"email": request.email, "password": request.password, "returnSecureToken": True}
+        )
+        resp.raise_for_status()
+        auth_data = resp.json()
+        id_token = auth_data.get("idToken")
+        user_id = auth_data.get("localId")
+        # Fetch display name from Firebase
+        user = auth.get_user(user_id)
+        name = user.display_name or ""
+        return AuthResponse(
+            token=id_token,
+            user_id=user_id,
+            email=auth_data.get("email"),
+            name=name
+        )
+    except requests.exceptions.HTTPError as http_err:
+        err = http_err.response.json().get("error", {}).get("message", str(http_err))
+        raise HTTPException(status_code=400, detail=f"Signin failed: {err}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Signin failed: {e}")
 
 # Analysis endpoint
 @app.post("/predict/")
